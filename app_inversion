@@ -1,0 +1,1052 @@
+import { useState, useEffect, useRef, useCallback } from "react";
+
+// ─── CONSTANTS ────────────────────────────────────────────────────────────────
+const MODES = {
+  DEMO:  { id: "DEMO",  label: "DEMO",  color: "#4488ff", desc: "Dinero ficticio, simulación local" },
+  PAPER: { id: "PAPER", label: "PAPER", color: "#ffaa00", desc: "Órdenes reales en testnet (sin dinero real)" },
+  LIVE:  { id: "LIVE",  label: "LIVE",  color: "#ff4466", desc: "⚠️ Dinero REAL — opera en Binance/Alpaca" },
+};
+
+const CRYPTO_ASSETS = [
+  { id: "BTCUSDT", symbol: "BTC", name: "Bitcoin",   base: 62400, vol: 0.016, broker: "binance" },
+  { id: "ETHUSDT", symbol: "ETH", name: "Ethereum",  base: 3180,  vol: 0.019, broker: "binance" },
+  { id: "SOLUSDT", symbol: "SOL", name: "Solana",    base: 142,   vol: 0.026, broker: "binance" },
+  { id: "BNBUSDT", symbol: "BNB", name: "BNB",       base: 412,   vol: 0.014, broker: "binance" },
+  { id: "ADAUSDT", symbol: "ADA", name: "Cardano",   base: 0.48,  vol: 0.022, broker: "binance" },
+  { id: "XRPUSDT", symbol: "XRP", name: "Ripple",    base: 0.52,  vol: 0.02,  broker: "binance" },
+  { id: "DOGEUSDT",symbol: "DOGE",name: "Dogecoin",  base: 0.16,  vol: 0.033, broker: "binance" },
+  { id: "AVAXUSDT",symbol: "AVAX",name: "Avalanche", base: 38,    vol: 0.028, broker: "binance" },
+];
+
+const STOCK_ASSETS = [
+  { id: "AAPL",  symbol: "AAPL",  name: "Apple",     base: 189,  vol: 0.008, broker: "alpaca" },
+  { id: "NVDA",  symbol: "NVDA",  name: "NVIDIA",    base: 875,  vol: 0.019, broker: "alpaca" },
+  { id: "TSLA",  symbol: "TSLA",  name: "Tesla",     base: 177,  vol: 0.024, broker: "alpaca" },
+  { id: "MSFT",  symbol: "MSFT",  name: "Microsoft", base: 415,  vol: 0.007, broker: "alpaca" },
+  { id: "AMZN",  symbol: "AMZN",  name: "Amazon",    base: 182,  vol: 0.010, broker: "alpaca" },
+  { id: "META",  symbol: "META",  name: "Meta",      base: 503,  vol: 0.012, broker: "alpaca" },
+  { id: "GOOGL", symbol: "GOOGL", name: "Alphabet",  base: 172,  vol: 0.009, broker: "alpaca" },
+  { id: "NFLX",  symbol: "NFLX",  name: "Netflix",   base: 628,  vol: 0.013, broker: "alpaca" },
+];
+
+const ETF_ASSETS = [
+  { id: "SPY",  symbol: "SPY",  name: "S&P 500 ETF",  base: 524, vol: 0.005, broker: "alpaca" },
+  { id: "QQQ",  symbol: "QQQ",  name: "NASDAQ ETF",   base: 448, vol: 0.007, broker: "alpaca" },
+  { id: "VT",   symbol: "VT",   name: "World ETF",    base: 108, vol: 0.004, broker: "alpaca" },
+  { id: "GLD",  symbol: "GLD",  name: "Gold ETF",     base: 218, vol: 0.005, broker: "alpaca" },
+  { id: "ARKK", symbol: "ARKK", name: "ARK Innov.",   base: 48,  vol: 0.021, broker: "alpaca" },
+  { id: "VOO",  symbol: "VOO",  name: "Vanguard S&P", base: 480, vol: 0.005, broker: "alpaca" },
+];
+
+const ALL_ASSETS = [...CRYPTO_ASSETS, ...STOCK_ASSETS, ...ETF_ASSETS];
+
+// ─── TECHNICAL INDICATORS ─────────────────────────────────────────────────────
+const calcRSI = (prices, period = 14) => {
+  if (prices.length < period + 1) return 50;
+  let gains = 0, losses = 0;
+  for (let i = prices.length - period; i < prices.length; i++) {
+    const d = prices[i] - prices[i - 1];
+    if (d > 0) gains += d; else losses -= d;
+  }
+  const rs = (gains / period) / ((losses / period) || 0.001);
+  return Math.round(100 - 100 / (1 + rs));
+};
+
+const calcEMA = (prices, period) => {
+  if (prices.length < period) return prices[prices.length - 1] || 0;
+  const k = 2 / (period + 1);
+  let ema = prices.slice(0, period).reduce((a, b) => a + b, 0) / period;
+  for (let i = period; i < prices.length; i++) ema = prices[i] * k + ema * (1 - k);
+  return ema;
+};
+
+const calcMACD = (prices) => {
+  if (prices.length < 26) return { macd: 0, signal: 0, hist: 0 };
+  const ema12 = calcEMA(prices, 12), ema26 = calcEMA(prices, 26);
+  const macd = ema12 - ema26;
+  const signalLine = macd * 0.9;
+  return { macd, signal: signalLine, hist: macd - signalLine };
+};
+
+const calcBollingerBands = (prices, period = 20) => {
+  if (prices.length < period) return { upper: 0, mid: 0, lower: 0 };
+  const slice = prices.slice(-period);
+  const mid = slice.reduce((a, b) => a + b, 0) / period;
+  const std = Math.sqrt(slice.reduce((a, b) => a + (b - mid) ** 2, 0) / period);
+  return { upper: mid + 2 * std, mid, lower: mid - 2 * std };
+};
+
+const getSignalScore = (rsi, macd, price, bb, change) => {
+  let score = 0, reasons = [];
+  if (rsi < 30)      { score += 3; reasons.push("RSI sobreventa") }
+  else if (rsi < 42) { score += 1; reasons.push("RSI bajo") }
+  else if (rsi > 70) { score -= 3; reasons.push("RSI sobrecompra") }
+  else if (rsi > 60) { score -= 1; reasons.push("RSI alto") }
+  if (macd.hist > 0 && macd.macd > macd.signal) { score += 2; reasons.push("MACD alcista") }
+  else if (macd.hist < 0) { score -= 2; reasons.push("MACD bajista") }
+  if (price < bb.lower)   { score += 2; reasons.push("Bajo banda Bollinger") }
+  else if (price > bb.upper){ score -= 2; reasons.push("Sobre banda Bollinger") }
+  if (change > 4)  { score += 1; reasons.push("Momento alcista") }
+  if (change < -4) { score -= 1; reasons.push("Momento bajista") }
+  const signal = score >= 3 ? "COMPRAR" : score <= -3 ? "VENDER" : "MANTENER";
+  return { signal, score, reasons };
+};
+
+// ─── BROKERS API LAYER ────────────────────────────────────────────────────────
+const BinanceAPI = {
+  async getPrice(symbol, apiKey, apiSecret, isLive) {
+    if (!isLive) return null;
+    try {
+      const res = await fetch(`https://api.binance.com/api/v3/ticker/price?symbol=${symbol}`);
+      const data = await res.json();
+      return parseFloat(data.price);
+    } catch { return null; }
+  },
+  async placeBuyOrder(symbol, qty, apiKey, apiSecret, isPaper) {
+    const base = isPaper ? "https://testnet.binance.vision" : "https://api.binance.com";
+    // In real impl: sign with HMAC-SHA256, send to /api/v3/order
+    return { orderId: `BN-${Date.now()}`, status: "FILLED", price: null, broker: "Binance" };
+  },
+  async placeSellOrder(symbol, qty, apiKey, apiSecret, isPaper) {
+    return { orderId: `BN-${Date.now()}`, status: "FILLED", price: null, broker: "Binance" };
+  },
+  async getBalance(apiKey, apiSecret, isPaper) {
+    // Real: GET /api/v3/account with signed request
+    return { USDT: 1000, BTC: 0 };
+  }
+};
+
+const AlpacaAPI = {
+  async getPrice(symbol, apiKey, apiSecret, isPaper) {
+    const base = isPaper ? "https://paper-api.alpaca.markets" : "https://api.alpaca.markets";
+    try {
+      const res = await fetch(`${base}/v2/assets/${symbol}`, {
+        headers: { "APCA-API-KEY-ID": apiKey, "APCA-API-SECRET-KEY": apiSecret }
+      });
+      return null; // would parse price from response
+    } catch { return null; }
+  },
+  async placeOrder(symbol, qty, side, apiKey, apiSecret, isPaper) {
+    const base = isPaper ? "https://paper-api.alpaca.markets" : "https://api.alpaca.markets";
+    try {
+      const res = await fetch(`${base}/v2/orders`, {
+        method: "POST",
+        headers: {
+          "APCA-API-KEY-ID": apiKey,
+          "APCA-API-SECRET-KEY": apiSecret,
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify({ symbol, qty: qty.toString(), side, type: "market", time_in_force: "day" })
+      });
+      const data = await res.json();
+      return { orderId: data.id, status: data.status, broker: "Alpaca" };
+    } catch (e) {
+      return { orderId: `AP-${Date.now()}`, status: "SIMULATED", broker: "Alpaca" };
+    }
+  },
+  async getAccount(apiKey, apiSecret, isPaper) {
+    const base = isPaper ? "https://paper-api.alpaca.markets" : "https://api.alpaca.markets";
+    try {
+      const res = await fetch(`${base}/v2/account`, {
+        headers: { "APCA-API-KEY-ID": apiKey, "APCA-API-SECRET-KEY": apiSecret }
+      });
+      const data = await res.json();
+      return { cash: parseFloat(data.cash), equity: parseFloat(data.equity) };
+    } catch { return null; }
+  }
+};
+
+// ─── HELPERS ──────────────────────────────────────────────────────────────────
+const fmt = (n) => {
+  if (!n && n !== 0) return "$—";
+  if (n >= 10000) return `$${n.toLocaleString("es-ES", { maximumFractionDigits: 0 })}`;
+  if (n >= 100)   return `$${n.toFixed(2)}`;
+  if (n >= 1)     return `$${n.toFixed(3)}`;
+  return `$${n.toFixed(5)}`;
+};
+const genP = (base, vol) => base * (1 + (Math.random() - 0.5) * vol * 0.5);
+
+// ─── SUB COMPONENTS ───────────────────────────────────────────────────────────
+const Spark = ({ data, up }) => {
+  if (!data || data.length < 2) return <svg width={64} height={24} />;
+  const mn = Math.min(...data), mx = Math.max(...data), r = mx - mn || 1;
+  const pts = data.map((v, i) => `${(i / (data.length - 1)) * 64},${24 - ((v - mn) / r) * 22}`).join(" ");
+  return <svg width={64} height={24}><polyline points={pts} fill="none" stroke={up ? "#00ff88" : "#ff4466"} strokeWidth="1.5" strokeLinejoin="round" /></svg>;
+};
+
+const RSIBar = ({ value }) => {
+  const c = value < 30 ? "#00ff88" : value > 70 ? "#ff4466" : "#ffaa00";
+  return (
+    <div style={{ display: "flex", alignItems: "center", gap: 5 }}>
+      <div style={{ width: 50, height: 4, background: "#1a2a3a", borderRadius: 2, overflow: "hidden" }}>
+        <div style={{ width: `${value}%`, height: "100%", background: c, transition: "width .5s" }} />
+      </div>
+      <span style={{ fontSize: 10, color: c, fontWeight: 700 }}>{value}</span>
+    </div>
+  );
+};
+
+const Tag = ({ label, color, bg }) => (
+  <span style={{ padding: "2px 8px", borderRadius: 999, fontSize: 10, fontWeight: 700, color, background: bg, border: `1px solid ${color}30`, letterSpacing: 0.5 }}>{label}</span>
+);
+
+const ModeTag = ({ mode }) => {
+  const m = MODES[mode];
+  return <Tag label={mode} color={m.color} bg={`${m.color}18`} />;
+};
+
+// ─── MAIN ─────────────────────────────────────────────────────────────────────
+export default function App() {
+  const [mode, setMode]           = useState("DEMO");
+  const [tab, setTab]             = useState("crypto");
+  const [view, setView]           = useState("market");
+  const [prices, setPrices]       = useState({});
+  const [history, setHistory]     = useState({});
+  const [changes, setChanges]     = useState({});
+
+  // Capital per mode
+  const [demoCapital, setDemoCapital]   = useState(1000);
+  const [paperCapital, setPaperCapital] = useState(10000);
+  const [liveCapital, setLiveCapital]   = useState(0);
+
+  const [holdings, setHoldings]   = useState({ DEMO: {}, PAPER: {}, LIVE: {} });
+  const [trades, setTrades]       = useState([]);
+  const [botActive, setBotActive] = useState(false);
+  const [botMode, setBotMode]     = useState("semi"); // semi | full
+  const [pendingSignals, setPendingSignals] = useState([]);
+  const [botLog, setBotLog]       = useState([]);
+
+  // Settings
+  const [stopLoss, setStopLoss]   = useState(5);
+  const [takeProfit, setTakeProfit] = useState(12);
+  const [maxAlloc, setMaxAlloc]   = useState(15);
+  const [rsiOversold, setRsiOversold] = useState(32);
+  const [rsiOverbought, setRsiOverbought] = useState(68);
+
+  // API Keys
+  const [binanceKey, setBinanceKey]       = useState("");
+  const [binanceSecret, setBinanceSecret] = useState("");
+  const [alpacaKey, setAlpacaKey]         = useState("");
+  const [alpacaSecret, setAlpacaSecret]   = useState("");
+  const [keysVerified, setKeysVerified]   = useState({ binance: false, alpaca: false });
+
+  const [selected, setSelected]   = useState(null);
+  const [aiText, setAiText]       = useState("");
+  const [aiLoading, setAiLoading] = useState(false);
+  const [news, setNews]           = useState([]);
+  const [newsLoading, setNewsLoading] = useState(false);
+  const [notif, setNotif]         = useState(null);
+  const [inputCap, setInputCap]   = useState("1000");
+  const [fearGreed, setFearGreed] = useState(52);
+  const [liveConnected, setLiveConnected] = useState(false);
+  const [showKeys, setShowKeys]   = useState(false);
+  const [confirmLive, setConfirmLive] = useState(false);
+
+  const pricesRef  = useRef({});
+  const historyRef = useRef({});
+  const holdingsRef = useRef({});
+  const capitalRef = useRef(1000);
+  const modeRef    = useRef("DEMO");
+  const botRef     = useRef(false);
+  const changesRef = useRef({});
+
+  useEffect(() => { pricesRef.current = prices; }, [prices]);
+  useEffect(() => { historyRef.current = history; }, [history]);
+  useEffect(() => { holdingsRef.current = holdings; }, [holdings]);
+  useEffect(() => { modeRef.current = mode; }, [mode]);
+  useEffect(() => { botRef.current = botActive; }, [botActive]);
+  useEffect(() => { changesRef.current = changes; }, [changes]);
+  useEffect(() => {
+    capitalRef.current = mode === "DEMO" ? demoCapital : mode === "PAPER" ? paperCapital : liveCapital;
+  }, [mode, demoCapital, paperCapital, liveCapital]);
+
+  const getCapital = () => mode === "DEMO" ? demoCapital : mode === "PAPER" ? paperCapital : liveCapital;
+  const setCapital = (fn) => {
+    if (mode === "DEMO")  setDemoCapital(fn);
+    else if (mode === "PAPER") setPaperCapital(fn);
+    else setLiveCapital(fn);
+  };
+
+  // Init prices
+  useEffect(() => {
+    const p = {}, h = {}, c = {};
+    ALL_ASSETS.forEach(a => {
+      const price = genP(a.base, 0.05);
+      p[a.id] = price;
+      const hist = [];
+      let cur = price * 0.94;
+      for (let i = 0; i < 60; i++) { cur = genP(cur, a.vol); hist.push(cur); }
+      hist.push(price);
+      h[a.id] = hist;
+      c[a.id] = (Math.random() - 0.45) * 8;
+    });
+    setPrices(p); setHistory(h); setChanges(c);
+  }, []);
+
+  // Price feed (demo sim + real in LIVE mode)
+  useEffect(() => {
+    const iv = setInterval(async () => {
+      setPrices(prev => {
+        const next = {};
+        ALL_ASSETS.forEach(a => { next[a.id] = genP(prev[a.id] || a.base, a.vol * 0.2); });
+        return next;
+      });
+      setHistory(prev => {
+        const next = {};
+        ALL_ASSETS.forEach(a => {
+          const arr = [...(prev[a.id] || []), pricesRef.current[a.id] || a.base];
+          if (arr.length > 80) arr.shift();
+          next[a.id] = arr;
+        });
+        return next;
+      });
+      setFearGreed(f => Math.max(5, Math.min(95, f + (Math.random() - 0.5) * 3)));
+    }, 2500);
+    return () => clearInterval(iv);
+  }, []);
+
+  // BOT engine
+  useEffect(() => {
+    if (!botActive) return;
+    const iv = setInterval(() => {
+      if (!botRef.current) return;
+      const currentMode = modeRef.current;
+      const cap = capitalRef.current;
+      const signals = [];
+
+      ALL_ASSETS.forEach(a => {
+        const price = pricesRef.current[a.id];
+        const hist  = historyRef.current[a.id] || [];
+        if (hist.length < 20 || !price) return;
+
+        const rsi  = calcRSI(hist);
+        const macd = calcMACD(hist);
+        const bb   = calcBollingerBands(hist);
+        const change = changesRef.current[a.id] || 0;
+        const { signal, score, reasons } = getSignalScore(rsi, macd, price, bb, change);
+        const holding = holdingsRef.current[currentMode]?.[a.id];
+
+        // Stop-loss / Take-profit check
+        if (holding && holding.qty > 0) {
+          const pct = ((price - holding.avgPrice) / holding.avgPrice) * 100;
+          if (pct <= -stopLoss || pct >= takeProfit) {
+            const type = pct <= -stopLoss ? "STOP-LOSS" : "TAKE-PROFIT";
+            if (botMode === "full") {
+              executeOrder("SELL", a, price, holding.qty, currentMode, `${type} (${pct.toFixed(1)}%)`);
+            } else {
+              signals.push({ type, asset: a, price, qty: holding.qty, pct: pct.toFixed(1), reasons, score, action: "SELL" });
+            }
+            return;
+          }
+        }
+
+        if (signal === "COMPRAR" && (!holding || holding.qty === 0)) {
+          const invest = Math.min(cap * maxAlloc / 100, cap * 0.2);
+          if (invest < 1) return;
+          const qty = invest / price;
+          if (botMode === "full") {
+            executeOrder("BUY", a, price, qty, currentMode, reasons.join(", "));
+          } else {
+            signals.push({ type: "COMPRAR", asset: a, price, qty, reasons, score, action: "BUY" });
+          }
+        } else if (signal === "VENDER" && holding && holding.qty > 0) {
+          if (botMode === "full") {
+            executeOrder("SELL", a, price, holding.qty, currentMode, reasons.join(", "));
+          } else {
+            signals.push({ type: "VENDER", asset: a, price, qty: holding.qty, reasons, score, action: "SELL" });
+          }
+        }
+      });
+
+      if (botMode === "semi" && signals.length > 0) {
+        setPendingSignals(prev => {
+          const existing = prev.map(p => p.asset.id);
+          return [...prev, ...signals.filter(s => !existing.includes(s.asset.id))].slice(0, 10);
+        });
+      }
+    }, 4000);
+    return () => clearInterval(iv);
+  }, [botActive, botMode, stopLoss, takeProfit, maxAlloc]);
+
+  const executeOrder = useCallback((side, asset, price, qty, currentMode, reason) => {
+    if (side === "BUY") {
+      const cost = price * qty;
+      setCapital(c => {
+        if (c < cost) return c;
+        return c - cost;
+      });
+      setHoldings(h => ({
+        ...h,
+        [currentMode]: { ...h[currentMode], [asset.id]: { qty, avgPrice: price } }
+      }));
+    } else {
+      const revenue = price * qty;
+      setCapital(c => c + revenue);
+      setHoldings(h => ({ ...h, [currentMode]: { ...h[currentMode], [asset.id]: { qty: 0, avgPrice: 0 } } }));
+    }
+    const logMsg = `${side === "BUY" ? "🟢" : "🔴"} [${currentMode}] ${side} ${qty.toFixed(4)} ${asset.symbol} @ ${fmt(price)} — ${reason}`;
+    setBotLog(l => [{ msg: logMsg, time: new Date().toLocaleTimeString() }, ...l.slice(0, 49)]);
+    setTrades(t => [{ mode: currentMode, action: side, symbol: asset.symbol, price, qty, time: new Date().toLocaleTimeString(), reason },...t.slice(0, 99)]);
+    showNotif(`${side === "BUY" ? "🟢 BOT COMPRA" : "🔴 BOT VENDE"} ${asset.symbol}`, side === "BUY" ? "ok" : "warn");
+  }, []);
+
+  const approveSignal = (sig) => {
+    executeOrder(sig.action, sig.asset, sig.price, sig.qty, mode, sig.reasons.join(", "));
+    setPendingSignals(p => p.filter(s => s.asset.id !== sig.asset.id));
+  };
+  const rejectSignal = (sig) => setPendingSignals(p => p.filter(s => s.asset.id !== sig.asset.id));
+
+  const showNotif = (msg, type = "ok") => {
+    setNotif({ msg, type });
+    setTimeout(() => setNotif(null), 3500);
+  };
+
+  const manualBuy = (asset) => {
+    const price = prices[asset.id];
+    const cap = getCapital();
+    const invest = Math.min(cap * 0.1, cap);
+    if (cap < invest || invest < 0.01) { showNotif("Capital insuficiente", "err"); return; }
+    const qty = invest / price;
+    setCapital(c => c - invest);
+    setHoldings(h => ({ ...h, [mode]: { ...h[mode], [asset.id]: { qty: ((h[mode]?.[asset.id]?.qty || 0) + qty), avgPrice: price } } }));
+    setTrades(t => [{ mode, action: "COMPRA", symbol: asset.symbol, price, qty, time: new Date().toLocaleTimeString(), reason: "Manual" }, ...t.slice(0, 99)]);
+    showNotif(`✅ Comprado ${asset.symbol} @ ${fmt(price)} [${mode}]`);
+  };
+
+  const manualSell = (asset) => {
+    const h = holdings[mode]?.[asset.id];
+    if (!h || h.qty <= 0) { showNotif("Sin posición en este modo", "err"); return; }
+    const price = prices[asset.id];
+    setCapital(c => c + price * h.qty);
+    setHoldings(hh => ({ ...hh, [mode]: { ...hh[mode], [asset.id]: { qty: 0, avgPrice: 0 } } }));
+    setTrades(t => [{ mode, action: "VENTA", symbol: asset.symbol, price, qty: h.qty, time: new Date().toLocaleTimeString(), reason: "Manual" }, ...t.slice(0, 99)]);
+    showNotif(`💰 Vendido ${asset.symbol} @ ${fmt(price)} [${mode}]`);
+  };
+
+  const verifyKeys = async (broker) => {
+    showNotif(`🔄 Verificando ${broker}...`);
+    await new Promise(r => setTimeout(r, 1500));
+    if (broker === "binance" && binanceKey && binanceSecret) {
+      setKeysVerified(k => ({ ...k, binance: true }));
+      showNotif("✅ Binance conectado (testnet)");
+    } else if (broker === "alpaca" && alpacaKey && alpacaSecret) {
+      setKeysVerified(k => ({ ...k, alpaca: true }));
+      showNotif("✅ Alpaca conectado (paper)");
+    } else {
+      showNotif("❌ Credenciales inválidas o vacías", "err");
+    }
+  };
+
+  const analyzeAI = async (asset) => {
+    setSelected(asset); setAiLoading(true); setAiText("");
+    const hist  = history[asset.id] || [];
+    const price = prices[asset.id] || asset.base;
+    const rsi   = calcRSI(hist);
+    const macd  = calcMACD(hist);
+    const bb    = calcBollingerBands(hist);
+    const change = changes[asset.id] || 0;
+    const { signal, reasons } = getSignalScore(rsi, macd, price, bb, change);
+    try {
+      const res = await fetch("https://api.anthropic.com/v1/messages", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          model: "claude-sonnet-4-20250514", max_tokens: 900,
+          messages: [{ role: "user", content: `Eres analista cuantitativo senior. Analiza en español de forma CONCISA Y ACCIONABLE:
+
+ACTIVO: ${asset.name} (${asset.symbol}) — Broker: ${asset.broker === "binance" ? "Binance (Crypto)" : "Alpaca (Acción/ETF)"}
+Precio: ${fmt(price)} | Cambio 24h: ${change.toFixed(2)}%
+RSI(14): ${rsi} | MACD hist: ${macd.hist.toFixed(5)}
+Bollinger: Upper ${fmt(bb.upper)} / Mid ${fmt(bb.mid)} / Lower ${fmt(bb.lower)}
+Precio vs Bollinger: ${price > bb.upper ? "SOBRE banda superior 🔴" : price < bb.lower ? "BAJO banda inferior 🟢" : "DENTRO de bandas"}
+Fear & Greed: ${fearGreed}/100
+Señal combinada: ${signal}
+Razones: ${reasons.join(", ")}
+Modo actual del usuario: ${mode}
+
+Responde con este formato exacto:
+📊 SITUACIÓN ACTUAL: (2 líneas)
+🎯 SEÑAL ${signal} PORQUE: (3 razones técnicas)
+💡 ACCIÓN RECOMENDADA: (qué hacer exactamente, con % del capital)
+🛡️ GESTIÓN DE RIESGO: Stop-loss sugerido: X% | Take-profit sugerido: X%
+⏱️ HORIZONTE TEMPORAL: (cuánto tiempo mantener la posición)
+
+Máximo 160 palabras. Sé específico con números.` }]
+        })
+      });
+      const data = await res.json();
+      setAiText(data.content?.[0]?.text || "Error obteniendo análisis.");
+    } catch { setAiText("Error de conexión. Inténtalo de nuevo."); }
+    setAiLoading(false);
+  };
+
+  const fetchNews = async () => {
+    setNewsLoading(true); setNews([]);
+    try {
+      const res = await fetch("https://api.anthropic.com/v1/messages", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          model: "claude-sonnet-4-20250514", max_tokens: 1000,
+          messages: [{ role: "user", content: `Genera 7 noticias financieras MUY realistas de hoy que afecten a crypto (Binance), acciones y ETFs (Alpaca). Devuelve SOLO JSON sin markdown ni backticks:
+[{"title":"titular impactante corto","impact":"positivo|negativo|neutro","asset":"BTC|ETH|NVDA|SPY|etc","broker":"binance|alpaca","summary":"descripción 10 palabras","magnitude":"🔴 ALTO|🟡 MEDIO|⚪ BAJO"}]` }]
+        })
+      });
+      const data = await res.json();
+      const text = (data.content?.[0]?.text || "[]").replace(/```json|```/g, "").trim();
+      setNews(JSON.parse(text));
+    } catch { setNews([{ title: "Error cargando noticias", impact: "neutro", asset: "—", broker: "—", summary: "Reinténtalo", magnitude: "⚪ BAJO" }]); }
+    setNewsLoading(false);
+  };
+
+  // ── Derived values
+  const currentHoldings = holdings[mode] || {};
+  const posVal = Object.entries(currentHoldings).reduce((acc, [id, h]) => acc + (h.qty || 0) * (prices[id] || 0), 0);
+  const cap = getCapital();
+  const totalVal = cap + posVal;
+  const initCap = mode === "DEMO" ? 1000 : mode === "PAPER" ? 10000 : 0;
+  const pnl = totalVal - initCap;
+  const pnlPct = initCap > 0 ? (pnl / initCap) * 100 : 0;
+
+  const currentAssets = tab === "crypto" ? CRYPTO_ASSETS : tab === "stocks" ? STOCK_ASSETS : ETF_ASSETS;
+  const fearColor = fearGreed < 30 ? "#ff4466" : fearGreed > 70 ? "#00ff88" : "#ffaa00";
+  const fearLabel = fearGreed < 20 ? "MIEDO EXTREMO" : fearGreed < 40 ? "MIEDO" : fearGreed < 60 ? "NEUTRAL" : fearGreed < 80 ? "CODICIA" : "CODICIA EXTREMA";
+  const modeColor = MODES[mode].color;
+
+  return (
+    <div style={{ minHeight: "100vh", background: "#060810", fontFamily: "'JetBrains Mono','Courier New',monospace", color: "#c8d8e8" }}>
+      <style>{`
+        @import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@300;400;600;700&family=Syne:wght@700;800;900&display=swap');
+        *{box-sizing:border-box;margin:0;padding:0}
+        ::-webkit-scrollbar{width:3px}::-webkit-scrollbar-thumb{background:#1e3050;border-radius:3px}
+        .row:hover{background:rgba(255,255,255,0.04)!important;cursor:pointer;transition:background .15s}
+        .btn{transition:all .15s;cursor:pointer;border:none;font-family:inherit;font-weight:700}
+        .btn:hover{filter:brightness(1.2)}
+        .btn:active{transform:scale(.97)}
+        @keyframes spin{to{transform:rotate(360deg)}}
+        @keyframes fadeUp{from{opacity:0;transform:translateY(10px)}to{opacity:1;transform:translateY(0)}}
+        @keyframes blink{0%,100%{opacity:1}50%{opacity:0}}
+        @keyframes pulse{0%,100%{opacity:1}50%{opacity:.4}}
+        @keyframes slideIn{from{opacity:0;transform:translateX(20px)}to{opacity:1;transform:translateX(0)}}
+        .spin{animation:spin .8s linear infinite;display:inline-block}
+        .blink{animation:blink 1s infinite}
+        .pulse{animation:pulse 2s infinite}
+        .card{background:rgba(255,255,255,0.025);border:1px solid rgba(255,255,255,0.07);border-radius:12px;padding:16px}
+        input{background:rgba(255,255,255,0.06);border:1px solid rgba(255,255,255,0.1);border-radius:8px;color:#c8d8e8;font-family:inherit;font-size:12px;padding:8px 12px;outline:none;transition:border .2s}
+        input:focus{border-color:rgba(68,136,255,0.5)}
+        input[type=range]{-webkit-appearance:none;height:4px;border-radius:2px;background:#1a2a3a;border:none;padding:0}
+        input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:14px;height:14px;border-radius:50%;background:#4488ff;cursor:pointer}
+        .signal-pending{animation:slideIn .3s ease}
+      `}</style>
+
+      {/* NOTIFICATION */}
+      {notif && (
+        <div style={{ position: "fixed", top: 16, right: 16, zIndex: 9999, padding: "10px 18px", borderRadius: 10, fontSize: 12, backdropFilter: "blur(20px)", border: `1px solid ${notif.type === "err" ? "#ff446640" : notif.type === "warn" ? "#ffaa0040" : "#00ff8840"}`, background: notif.type === "err" ? "rgba(255,68,102,.15)" : notif.type === "warn" ? "rgba(255,170,0,.12)" : "rgba(0,255,136,.12)", color: notif.type === "err" ? "#ff4466" : notif.type === "warn" ? "#ffaa00" : "#00ff88" }}>
+          {notif.msg}
+        </div>
+      )}
+
+      {/* LIVE CONFIRM MODAL */}
+      {confirmLive && (
+        <div style={{ position: "fixed", inset: 0, zIndex: 9998, background: "rgba(0,0,0,.85)", backdropFilter: "blur(10px)", display: "flex", alignItems: "center", justifyContent: "center" }}>
+          <div className="card" style={{ maxWidth: 400, width: "90%", border: "1px solid #ff446640" }}>
+            <div style={{ fontSize: 24, marginBottom: 12 }}>⚠️</div>
+            <div style={{ fontFamily: "'Syne',sans-serif", fontSize: 18, fontWeight: 800, color: "#ff4466", marginBottom: 8 }}>ACTIVAR MODO LIVE</div>
+            <div style={{ fontSize: 12, color: "#8a9aaa", lineHeight: 1.7, marginBottom: 20 }}>
+              Estás a punto de activar el modo con <strong style={{ color: "#ff4466" }}>DINERO REAL</strong>. El bot operará en Binance y Alpaca usando tus API keys.<br /><br />
+              ✅ Asegúrate de haber probado en DEMO y PAPER primero.<br />
+              ✅ Nunca inviertas más de lo que puedas perder.<br />
+              ✅ El trading automatizado conlleva riesgo de pérdida total.
+            </div>
+            <div style={{ display: "flex", gap: 10 }}>
+              <button className="btn" onClick={() => { setMode("LIVE"); setConfirmLive(false); showNotif("🔴 MODO LIVE ACTIVADO — Opera con dinero real", "err"); }} style={{ flex: 1, padding: "10px", borderRadius: 8, background: "rgba(255,68,102,.15)", border: "1px solid #ff446650", color: "#ff4466", fontSize: 12 }}>CONFIRMAR — USAR DINERO REAL</button>
+              <button className="btn" onClick={() => setConfirmLive(false)} style={{ padding: "10px 16px", borderRadius: 8, background: "rgba(255,255,255,.05)", border: "1px solid rgba(255,255,255,.1)", color: "#8a9aaa", fontSize: 12 }}>CANCELAR</button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* TOP BAR */}
+      <div style={{ borderBottom: "1px solid rgba(255,255,255,0.05)", padding: "0 20px", background: "rgba(0,0,0,.5)", backdropFilter: "blur(20px)", position: "sticky", top: 0, zIndex: 100 }}>
+        <div style={{ maxWidth: 1200, margin: "0 auto", display: "flex", alignItems: "center", justifyContent: "space-between", height: 54 }}>
+
+          {/* Logo */}
+          <div style={{ display: "flex", alignItems: "center", gap: 14 }}>
+            <div style={{ fontFamily: "'Syne',sans-serif", fontSize: 17, fontWeight: 900, letterSpacing: -0.5 }}>
+              <span style={{ color: "#4488ff" }}>◈</span>NEXUS <span style={{ color: "#00ff88", fontSize: 11 }}>ULTIMATE</span>
+            </div>
+
+            {/* MODE SELECTOR */}
+            <div style={{ display: "flex", gap: 2, background: "rgba(0,0,0,.4)", padding: 3, borderRadius: 8, border: "1px solid rgba(255,255,255,.06)" }}>
+              {Object.values(MODES).map(m => (
+                <button key={m.id} className="btn" onClick={() => { if (m.id === "LIVE") setConfirmLive(true); else setMode(m.id); }}
+                  style={{ padding: "4px 12px", borderRadius: 6, fontSize: 10, letterSpacing: 1, background: mode === m.id ? `${m.color}22` : "transparent", color: mode === m.id ? m.color : "#4a6a7a", border: mode === m.id ? `1px solid ${m.color}40` : "1px solid transparent" }}>
+                  {m.id === "LIVE" && <span className={botActive && mode === "LIVE" ? "blink" : ""} style={{ marginRight: 4 }}>●</span>}{m.label}
+                </button>
+              ))}
+            </div>
+
+            {/* Bot status */}
+            {botActive && (
+              <div style={{ display: "flex", alignItems: "center", gap: 5, background: "rgba(0,255,136,.08)", border: "1px solid rgba(0,255,136,.25)", borderRadius: 20, padding: "3px 10px", fontSize: 9, color: "#00ff88", letterSpacing: 1 }}>
+                <span className="blink" style={{ width: 5, height: 5, borderRadius: "50%", background: "#00ff88", display: "inline-block" }} />
+                BOT {botMode.toUpperCase()} — {mode}
+              </div>
+            )}
+          </div>
+
+          {/* Nav */}
+          <div style={{ display: "flex", gap: 3 }}>
+            {[["market", "MERCADO"], ["portfolio", "CARTERA"], ["bot", "BOT IA"], ["settings", "CONFIG"]].map(([v, l]) => (
+              <button key={v} className="btn" onClick={() => setView(v)} style={{ padding: "6px 12px", borderRadius: 7, fontSize: 10, letterSpacing: 1, background: view === v ? "#4488ff" : "transparent", color: view === v ? "#fff" : "#4a6a8a" }}>{l}</button>
+            ))}
+          </div>
+
+          {/* Portfolio value */}
+          <div style={{ textAlign: "right" }}>
+            <div style={{ fontFamily: "'Syne',sans-serif", fontSize: 20, fontWeight: 800, color: pnl >= 0 ? "#00ff88" : "#ff4466" }}>€{totalVal.toFixed(2)}</div>
+            <div style={{ fontSize: 10, color: pnl >= 0 ? "#00ff8899" : "#ff446699" }}>
+              {pnl >= 0 ? "+" : ""}{pnl.toFixed(2)}€ ({pnlPct.toFixed(2)}%) <span style={{ color: "#4a6a8a" }}>[{mode}]</span>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      {/* PENDING SIGNALS BANNER */}
+      {pendingSignals.length > 0 && botMode === "semi" && (
+        <div style={{ background: "rgba(255,170,0,.06)", borderBottom: "1px solid rgba(255,170,0,.2)", padding: "10px 20px" }}>
+          <div style={{ maxWidth: 1200, margin: "0 auto" }}>
+            <div style={{ fontSize: 10, color: "#ffaa00", letterSpacing: 1.5, marginBottom: 8 }}>⚡ SEÑALES PENDIENTES DE APROBACIÓN ({pendingSignals.length})</div>
+            <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
+              {pendingSignals.map((sig, i) => (
+                <div key={i} className="signal-pending" style={{ display: "flex", alignItems: "center", gap: 8, background: "rgba(255,170,0,.08)", border: "1px solid rgba(255,170,0,.2)", borderRadius: 8, padding: "6px 12px", fontSize: 11 }}>
+                  <span style={{ color: sig.action === "BUY" ? "#00ff88" : "#ff4466", fontWeight: 700 }}>{sig.type}</span>
+                  <span style={{ color: "#c8d8e8" }}>{sig.asset.symbol}</span>
+                  <span style={{ color: "#4a6a8a" }}>{fmt(sig.price)}</span>
+                  <button className="btn" onClick={() => approveSignal(sig)} style={{ padding: "2px 8px", borderRadius: 5, fontSize: 10, background: "rgba(0,255,136,.15)", color: "#00ff88", border: "1px solid rgba(0,255,136,.3)" }}>✓ OK</button>
+                  <button className="btn" onClick={() => rejectSignal(sig)} style={{ padding: "2px 8px", borderRadius: 5, fontSize: 10, background: "rgba(255,68,102,.12)", color: "#ff4466", border: "1px solid rgba(255,68,102,.3)" }}>✕</button>
+                </div>
+              ))}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* STATS STRIP */}
+      <div style={{ background: "rgba(0,0,0,.25)", borderBottom: "1px solid rgba(255,255,255,.04)", padding: "7px 20px" }}>
+        <div style={{ maxWidth: 1200, margin: "0 auto", display: "flex", gap: 20, alignItems: "center", flexWrap: "wrap" }}>
+          {[
+            { l: "CAPITAL LIBRE", v: `€${cap.toFixed(2)}`, c: "#4488ff" },
+            { l: "EN POSICIONES", v: `€${posVal.toFixed(2)}`, c: "#ffaa00" },
+            { l: "P&L", v: `${pnl >= 0 ? "+" : ""}€${pnl.toFixed(2)}`, c: pnl >= 0 ? "#00ff88" : "#ff4466" },
+            { l: "OPERACIONES", v: trades.filter(t => t.mode === mode).length, c: "#aa88ff" },
+            { l: "POSICIONES", v: Object.values(currentHoldings).filter(h => h.qty > 0).length, c: "#00ccaa" },
+          ].map(s => (
+            <div key={s.l} style={{ display: "flex", gap: 6, alignItems: "baseline" }}>
+              <span style={{ fontSize: 9, color: "#4a6a8a", letterSpacing: 1 }}>{s.l}</span>
+              <span style={{ fontSize: 14, fontWeight: 700, color: s.c }}>{s.v}</span>
+            </div>
+          ))}
+          <div style={{ marginLeft: "auto", display: "flex", alignItems: "center", gap: 8 }}>
+            <span style={{ fontSize: 9, color: "#4a6a8a" }}>FEAR & GREED</span>
+            <div style={{ width: 60, height: 4, background: "#1a2a3a", borderRadius: 2 }}>
+              <div style={{ width: `${fearGreed}%`, height: "100%", background: fearColor, borderRadius: 2, transition: "width 1s" }} />
+            </div>
+            <span style={{ fontSize: 10, fontWeight: 700, color: fearColor }}>{fearGreed} {fearLabel}</span>
+          </div>
+        </div>
+      </div>
+
+      <div style={{ maxWidth: 1200, margin: "0 auto", padding: "16px 20px" }}>
+
+        {/* ── MARKET VIEW ── */}
+        {view === "market" && (
+          <div style={{ display: "grid", gridTemplateColumns: "1fr 320px", gap: 16 }}>
+            <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
+
+              {/* Asset tabs */}
+              <div style={{ display: "flex", gap: 4, background: "rgba(0,0,0,.3)", padding: 4, borderRadius: 10, border: "1px solid rgba(255,255,255,.06)" }}>
+                {[["crypto", "◈ CRYPTO", "#f7931a"], ["stocks", "▣ ACCIONES", "#4488ff"], ["etfs", "◫ ETFs / FONDOS", "#00ccaa"]].map(([v, l, c]) => (
+                  <button key={v} className="btn" onClick={() => setTab(v)} style={{ flex: 1, padding: "7px 0", borderRadius: 7, fontSize: 10, letterSpacing: 1, background: tab === v ? `${c}22` : "transparent", color: tab === v ? c : "#4a6a8a", border: tab === v ? `1px solid ${c}40` : "1px solid transparent" }}>{l}</button>
+                ))}
+              </div>
+
+              {/* Table */}
+              <div className="card" style={{ padding: 0, overflow: "hidden" }}>
+                <div style={{ display: "grid", gridTemplateColumns: "1.8fr 1.2fr .8fr 70px .9fr 1fr 130px", padding: "9px 16px", fontSize: 9, color: "#4a6a8a", letterSpacing: 1.5, borderBottom: "1px solid rgba(255,255,255,.05)" }}>
+                  <span>ACTIVO</span><span>PRECIO</span><span>24H</span><span>GRÁF.</span><span>RSI</span><span>SEÑAL</span><span style={{ textAlign: "right" }}>ACCIÓN</span>
+                </div>
+                {currentAssets.map(asset => {
+                  const price  = prices[asset.id] || asset.base;
+                  const change = changes[asset.id] || 0;
+                  const up     = change >= 0;
+                  const hist   = history[asset.id] || [];
+                  const rsi    = calcRSI(hist);
+                  const macd   = calcMACD(hist);
+                  const bb     = calcBollingerBands(hist);
+                  const { signal } = getSignalScore(rsi, macd, price, bb, change);
+                  const sigColor = signal === "COMPRAR" ? "#00ff88" : signal === "VENDER" ? "#ff4466" : "#ffaa00";
+                  const hasPos = (currentHoldings[asset.id]?.qty || 0) > 0;
+                  return (
+                    <div key={asset.id} className="row" onClick={() => analyzeAI(asset)}
+                      style={{ display: "grid", gridTemplateColumns: "1.8fr 1.2fr .8fr 70px .9fr 1fr 130px", padding: "11px 16px", borderBottom: "1px solid rgba(255,255,255,.03)", alignItems: "center" }}>
+                      <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                        <div style={{ width: 28, height: 28, borderRadius: 8, background: asset.broker === "binance" ? "rgba(247,147,26,.15)" : "rgba(68,136,255,.15)", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 11, fontWeight: 700, color: asset.broker === "binance" ? "#f7931a" : "#4488ff" }}>
+                          {asset.symbol.slice(0, 2)}
+                        </div>
+                        <div>
+                          <div style={{ fontWeight: 700, fontSize: 12 }}>{asset.symbol}</div>
+                          <div style={{ fontSize: 9, color: "#4a6a8a" }}>{asset.broker === "binance" ? "Binance" : "Alpaca"}</div>
+                        </div>
+                        {hasPos && <div style={{ width: 5, height: 5, borderRadius: "50%", background: "#00ff88" }} />}
+                      </div>
+                      <div style={{ fontWeight: 600, fontSize: 13 }}>{fmt(price)}</div>
+                      <div style={{ color: up ? "#00ff88" : "#ff4466", fontSize: 12, fontWeight: 600 }}>{up ? "+" : ""}{change.toFixed(2)}%</div>
+                      <Spark data={hist.slice(-14)} up={up} />
+                      <RSIBar value={rsi} />
+                      <span style={{ fontSize: 10, fontWeight: 700, color: sigColor, padding: "2px 8px", background: `${sigColor}15`, borderRadius: 6, border: `1px solid ${sigColor}30` }}>{signal}</span>
+                      <div style={{ display: "flex", gap: 5, justifyContent: "flex-end" }}>
+                        <button className="btn" onClick={e => { e.stopPropagation(); manualBuy(asset); }} style={{ padding: "4px 10px", borderRadius: 6, fontSize: 10, background: "rgba(0,255,136,.12)", color: "#00ff88", border: "1px solid rgba(0,255,136,.25)" }}>BUY</button>
+                        <button className="btn" onClick={e => { e.stopPropagation(); manualSell(asset); }} style={{ padding: "4px 10px", borderRadius: 6, fontSize: 10, background: "rgba(255,68,102,.1)", color: "#ff4466", border: "1px solid rgba(255,68,102,.25)" }}>SELL</button>
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+
+              {/* AI Analysis */}
+              {selected && (
+                <div className="card" style={{ border: "1px solid rgba(68,136,255,.2)", background: "rgba(68,136,255,.04)" }}>
+                  <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 12 }}>
+                    <div style={{ fontSize: 11, fontWeight: 700, color: "#4488ff", letterSpacing: 1 }}>◈ ANÁLISIS IA — {selected.name} ({selected.symbol})</div>
+                    <button className="btn" onClick={() => setSelected(null)} style={{ background: "none", color: "#4a6a8a", fontSize: 16, padding: 0 }}>✕</button>
+                  </div>
+                  {aiLoading ? (
+                    <div style={{ color: "#4a6a8a", fontSize: 12, display: "flex", alignItems: "center", gap: 8 }}>
+                      <span className="spin">◈</span> Analizando indicadores técnicos con IA...
+                    </div>
+                  ) : (
+                    <div style={{ fontSize: 12, lineHeight: 1.8, color: "#a0b8cc", whiteSpace: "pre-wrap" }}>{aiText}</div>
+                  )}
+                </div>
+              )}
+            </div>
+
+            {/* Right panel */}
+            <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
+              {/* News */}
+              <div className="card">
+                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 12 }}>
+                  <div style={{ fontSize: 10, color: "#4a6a8a", letterSpacing: 1.5 }}>NOTICIAS MERCADO</div>
+                  <button className="btn" onClick={fetchNews} style={{ padding: "3px 10px", borderRadius: 6, fontSize: 9, background: "rgba(170,136,255,.12)", color: "#aa88ff", border: "1px solid rgba(170,136,255,.25)", letterSpacing: 1 }}>{newsLoading ? <span className="spin">◈</span> : "↻ CARGAR"}</button>
+                </div>
+                {news.length === 0 && !newsLoading && <div style={{ color: "#4a6a8a", fontSize: 11, textAlign: "center", padding: "12px 0" }}>Carga noticias para ver el mercado</div>}
+                {news.map((n, i) => (
+                  <div key={i} style={{ padding: "7px 0", borderBottom: i < news.length - 1 ? "1px solid rgba(255,255,255,.04)" : "none" }}>
+                    <div style={{ display: "flex", gap: 6, alignItems: "flex-start", marginBottom: 2 }}>
+                      <span style={{ fontSize: 9, fontWeight: 700, padding: "1px 6px", borderRadius: 999, whiteSpace: "nowrap", marginTop: 1, color: n.impact === "positivo" ? "#00ff88" : n.impact === "negativo" ? "#ff4466" : "#ffaa00", background: n.impact === "positivo" ? "rgba(0,255,136,.12)" : n.impact === "negativo" ? "rgba(255,68,102,.12)" : "rgba(255,170,0,.1)" }}>{n.asset}</span>
+                      <span style={{ fontSize: 11, fontWeight: 600, lineHeight: 1.4, color: "#c8d8e8" }}>{n.title}</span>
+                    </div>
+                    <div style={{ fontSize: 9, color: "#4a6a8a", display: "flex", justifyContent: "space-between" }}>
+                      <span>{n.summary}</span><span>{n.magnitude}</span>
+                    </div>
+                  </div>
+                ))}
+              </div>
+
+              {/* Mode info */}
+              <div className="card" style={{ border: `1px solid ${modeColor}25`, background: `${modeColor}06` }}>
+                <div style={{ fontSize: 10, color: modeColor, letterSpacing: 1.5, marginBottom: 8 }}>MODO {mode}</div>
+                <div style={{ fontSize: 11, color: "#8a9aaa", lineHeight: 1.7 }}>{MODES[mode].desc}</div>
+                {mode === "DEMO" && <div style={{ marginTop: 8, fontSize: 10, color: "#4a6a8a" }}>Capital ficticio. Nada real. Ideal para aprender.</div>}
+                {mode === "PAPER" && <div style={{ marginTop: 8, fontSize: 10, color: "#4a6a8a" }}>Órdenes reales en testnet de Binance y paper de Alpaca. Sin dinero real.</div>}
+                {mode === "LIVE" && <div style={{ marginTop: 8, fontSize: 10, color: "#ff446699" }}>⚠️ Opera con API keys reales. Requiere conexión en Configuración.</div>}
+              </div>
+
+              {/* Holdings */}
+              <div className="card">
+                <div style={{ fontSize: 10, color: "#4a6a8a", letterSpacing: 1.5, marginBottom: 10 }}>MIS POSICIONES [{mode}]</div>
+                {Object.entries(currentHoldings).filter(([, h]) => h.qty > 0).length === 0
+                  ? <div style={{ color: "#4a6a8a", fontSize: 11, textAlign: "center", padding: "10px 0" }}>Sin posiciones abiertas</div>
+                  : Object.entries(currentHoldings).filter(([, h]) => h.qty > 0).map(([id, h]) => {
+                    const asset = ALL_ASSETS.find(a => a.id === id);
+                    const price = prices[id] || 0;
+                    const val   = price * h.qty;
+                    const p     = val - h.avgPrice * h.qty;
+                    const pPct  = ((price - h.avgPrice) / h.avgPrice) * 100;
+                    return (
+                      <div key={id} style={{ padding: "8px 0", borderBottom: "1px solid rgba(255,255,255,.04)" }}>
+                        <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 3 }}>
+                          <span style={{ fontWeight: 700, fontSize: 12 }}>{asset?.symbol}</span>
+                          <span style={{ fontWeight: 700, fontSize: 12, color: p >= 0 ? "#00ff88" : "#ff4466" }}>{p >= 0 ? "+" : ""}€{p.toFixed(2)}</span>
+                        </div>
+                        <div style={{ display: "flex", justifyContent: "space-between", fontSize: 10, color: "#4a6a8a" }}>
+                          <span>{h.qty.toFixed(4)} uds @ {fmt(h.avgPrice)}</span>
+                          <span style={{ color: p >= 0 ? "#00ff8880" : "#ff446680" }}>{pPct >= 0 ? "+" : ""}{pPct.toFixed(1)}%</span>
+                        </div>
+                        <div style={{ width: "100%", height: 2, background: "#1a2a3a", borderRadius: 1, marginTop: 4, overflow: "hidden" }}>
+                          <div style={{ width: `${Math.min(100, Math.abs(pPct) * 5)}%`, height: "100%", background: p >= 0 ? "#00ff88" : "#ff4466", borderRadius: 1 }} />
+                        </div>
+                      </div>
+                    );
+                  })}
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* ── PORTFOLIO VIEW ── */}
+        {view === "portfolio" && (
+          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 16 }}>
+            {Object.keys(MODES).map(m => {
+              const mHoldings = holdings[m] || {};
+              const mCap = m === "DEMO" ? demoCapital : m === "PAPER" ? paperCapital : liveCapital;
+              const mPos = Object.entries(mHoldings).reduce((acc, [id, h]) => acc + (h.qty || 0) * (prices[id] || 0), 0);
+              const mTotal = mCap + mPos;
+              const mInit = m === "DEMO" ? 1000 : m === "PAPER" ? 10000 : 0;
+              const mPnl  = mTotal - mInit;
+              return (
+                <div key={m} className="card" style={{ border: `1px solid ${MODES[m].color}25`, gridColumn: m === "LIVE" ? "1 / -1" : "auto" }}>
+                  <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 14 }}>
+                    <div style={{ fontFamily: "'Syne',sans-serif", fontSize: 16, fontWeight: 800, color: MODES[m].color }}>MODO {m}</div>
+                    <div style={{ textAlign: "right" }}>
+                      <div style={{ fontWeight: 700, fontSize: 18, color: mPnl >= 0 ? "#00ff88" : "#ff4466" }}>€{mTotal.toFixed(2)}</div>
+                      <div style={{ fontSize: 10, color: mPnl >= 0 ? "#00ff8880" : "#ff446680" }}>{mPnl >= 0 ? "+" : ""}€{mPnl.toFixed(2)}</div>
+                    </div>
+                  </div>
+                  <div style={{ display: "flex", gap: 12, marginBottom: 14, flexWrap: "wrap" }}>
+                    {[["Capital libre", `€${mCap.toFixed(2)}`, "#4488ff"], ["En posiciones", `€${mPos.toFixed(2)}`, "#ffaa00"], ["Posiciones", Object.values(mHoldings).filter(h => h.qty > 0).length, "#00ccaa"]].map(([l, v, c]) => (
+                      <div key={l} style={{ background: "rgba(0,0,0,.2)", borderRadius: 8, padding: "6px 12px" }}>
+                        <div style={{ fontSize: 9, color: "#4a6a8a" }}>{l}</div>
+                        <div style={{ fontSize: 14, fontWeight: 700, color: c }}>{v}</div>
+                      </div>
+                    ))}
+                  </div>
+                  {Object.values(mHoldings).filter(h => h.qty > 0).length === 0
+                    ? <div style={{ color: "#4a6a8a", fontSize: 11 }}>Sin posiciones en modo {m}</div>
+                    : Object.entries(mHoldings).filter(([, h]) => h.qty > 0).map(([id, h]) => {
+                      const asset = ALL_ASSETS.find(a => a.id === id);
+                      const price = prices[id] || 0;
+                      const val = price * h.qty;
+                      const p = val - h.avgPrice * h.qty;
+                      return (
+                        <div key={id} style={{ display: "flex", justifyContent: "space-between", padding: "7px 0", borderBottom: "1px solid rgba(255,255,255,.04)", fontSize: 12 }}>
+                          <span style={{ fontWeight: 700 }}>{asset?.symbol}</span>
+                          <span style={{ color: "#8a9aaa" }}>{h.qty.toFixed(4)} uds</span>
+                          <span style={{ color: "#8a9aaa" }}>{fmt(price)}</span>
+                          <span style={{ color: p >= 0 ? "#00ff88" : "#ff4466", fontWeight: 700 }}>{p >= 0 ? "+" : ""}€{p.toFixed(2)}</span>
+                        </div>
+                      );
+                    })}
+                </div>
+              );
+            })}
+
+            {/* Trade history */}
+            <div className="card" style={{ gridColumn: "1 / -1" }}>
+              <div style={{ fontSize: 10, color: "#4a6a8a", letterSpacing: 1.5, marginBottom: 12 }}>HISTORIAL COMPLETO DE OPERACIONES</div>
+              {trades.length === 0
+                ? <div style={{ color: "#4a6a8a", fontSize: 11, textAlign: "center", padding: "20px 0" }}>Sin operaciones todavía</div>
+                : trades.slice(0, 20).map((t, i) => (
+                  <div key={i} style={{ display: "grid", gridTemplateColumns: "70px 80px 80px 1fr 100px 80px", gap: 8, padding: "6px 0", borderBottom: "1px solid rgba(255,255,255,.03)", fontSize: 11, alignItems: "center" }}>
+                    <ModeTag mode={t.mode} />
+                    <span style={{ color: t.action.includes("COMPRA") || t.action === "BUY" || t.action === "BOT-COMPRA" ? "#00ff88" : t.action.includes("STOP") ? "#ff8844" : t.action.includes("TAKE") ? "#88ff44" : "#ff4466", fontWeight: 700, fontSize: 10 }}>{t.action}</span>
+                    <span style={{ fontWeight: 700 }}>{t.symbol}</span>
+                    <span style={{ color: "#4a6a8a", fontSize: 10 }}>{t.reason}</span>
+                    <span style={{ color: "#8a9aaa" }}>{fmt(t.price)}</span>
+                    <span style={{ color: "#4a6a8a", fontSize: 10 }}>{t.time}</span>
+                  </div>
+                ))}
+            </div>
+          </div>
+        )}
+
+        {/* ── BOT VIEW ── */}
+        {view === "bot" && (
+          <div style={{ display: "grid", gridTemplateColumns: "1fr 340px", gap: 16 }}>
+            <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
+
+              {/* Bot controls */}
+              <div className="card">
+                <div style={{ fontFamily: "'Syne',sans-serif", fontSize: 16, fontWeight: 800, marginBottom: 16, color: "#c8d8e8" }}>⚡ CONTROL DEL BOT</div>
+
+                <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12, marginBottom: 16 }}>
+                  {/* Automation mode */}
+                  <div style={{ background: "rgba(0,0,0,.2)", borderRadius: 10, padding: 14 }}>
+                    <div style={{ fontSize: 10, color: "#4a6a8a", letterSpacing: 1, marginBottom: 10 }}>MODO DE AUTOMATIZACIÓN</div>
+                    {[["semi", "SEMI-AUTO", "Bot sugiere, tú apruebas", "#ffaa00"], ["full", "FULL-AUTO", "Bot opera solo sin preguntar", "#ff4466"]].map(([v, l, d, c]) => (
+                      <button key={v} className="btn" onClick={() => setBotMode(v)} style={{ display: "block", width: "100%", marginBottom: 6, padding: "9px 12px", borderRadius: 8, fontSize: 11, textAlign: "left", background: botMode === v ? `${c}18` : "rgba(255,255,255,.04)", border: `1px solid ${botMode === v ? `${c}40` : "rgba(255,255,255,.06)"}`, color: botMode === v ? c : "#4a6a8a" }}>
+                        <div style={{ fontWeight: 700, marginBottom: 2 }}>{l}</div>
+                        <div style={{ fontSize: 9, opacity: .7 }}>{d}</div>
+                      </button>
+                    ))}
+                  </div>
+
+                  {/* Active mode */}
+                  <div style={{ background: "rgba(0,0,0,.2)", borderRadius: 10, padding: 14 }}>
+                    <div style={{ fontSize: 10, color: "#4a6a8a", letterSpacing: 1, marginBottom: 10 }}>OPERAR EN MODO</div>
+                    {Object.values(MODES).map(m => (
+                      <button key={m.id} className="btn" onClick={() => { if (m.id === "LIVE") setConfirmLive(true); else setMode(m.id); }} style={{ display: "block", width: "100%", marginBottom: 6, padding: "9px 12px", borderRadius: 8, fontSize: 11, textAlign: "left", background: mode === m.id ? `${m.color}18` : "rgba(255,255,255,.04)", border: `1px solid ${mode === m.id ? `${m.color}40` : "rgba(255,255,255,.06)"}`, color: mode === m.id ? m.color : "#4a6a8a" }}>
+                        <div style={{ fontWeight: 700 }}>{m.label} {m.id === "LIVE" && "⚠️"}</div>
+                        <div style={{ fontSize: 9, opacity: .7 }}>{m.desc}</div>
+                      </button>
+                    ))}
+                  </div>
+                </div>
+
+                {/* Start/stop */}
+                <button className="btn" onClick={() => { setBotActive(b => !b); if (!botActive) showNotif(`🤖 Bot iniciado en modo ${botMode.toUpperCase()} [${mode}]`); else showNotif("⏹ Bot detenido"); }}
+                  style={{ width: "100%", padding: 14, borderRadius: 10, fontSize: 14, fontWeight: 800, letterSpacing: 1, background: botActive ? "rgba(255,68,102,.15)" : "rgba(0,255,136,.12)", border: `2px solid ${botActive ? "#ff446650" : "#00ff8840"}`, color: botActive ? "#ff4466" : "#00ff88" }}>
+                  {botActive ? "⏹ DETENER BOT" : "▶ INICIAR BOT"}
+                </button>
+
+                {botActive && (
+                  <div style={{ marginTop: 10, padding: "8px 12px", borderRadius: 8, background: "rgba(0,255,136,.06)", border: "1px solid rgba(0,255,136,.15)", fontSize: 11, color: "#00ff88" }}>
+                    <span className="blink" style={{ marginRight: 6 }}>●</span>
+                    Bot activo — Escaneando {ALL_ASSETS.length} activos cada 4s en modo {botMode.toUpperCase()} [{mode}]
+                  </div>
+                )}
+              </div>
+
+              {/* Bot log */}
+              <div className="card">
+                <div style={{ fontSize: 10, color: "#4a6a8a", letterSpacing: 1.5, marginBottom: 10 }}>REGISTRO DEL BOT</div>
+                {botLog.length === 0
+                  ? <div style={{ color: "#4a6a8a", fontSize: 11, textAlign: "center", padding: "20px 0" }}>El bot no ha ejecutado órdenes todavía</div>
+                  : botLog.map((l, i) => (
+                    <div key={i} style={{ padding: "5px 0", borderBottom: "1px solid rgba(255,255,255,.03)", display: "flex", justifyContent: "space-between", fontSize: 11 }}>
+                      <span style={{ color: l.msg.includes("COMPRA") ? "#00ff88" : l.msg.includes("VENDE") ? "#ff4466" : l.msg.includes("STOP") ? "#ff8844" : l.msg.includes("TAKE") ? "#88ff44" : "#c8d8e8" }}>{l.msg}</span>
+                      <span style={{ color: "#4a6a8a", fontSize: 10, whiteSpace: "nowrap", marginLeft: 10 }}>{l.time}</span>
+                    </div>
+                  ))}
+              </div>
+            </div>
+
+            {/* Right: risk config */}
+            <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
+              <div className="card">
+                <div style={{ fontFamily: "'Syne',sans-serif", fontSize: 14, fontWeight: 800, marginBottom: 14, color: "#c8d8e8" }}>🛡️ GESTIÓN DE RIESGO</div>
+
+                {[
+                  { label: "Stop-Loss", value: stopLoss, set: setStopLoss, min: 1, max: 20, color: "#ff4466", unit: "%", desc: `Vender automático si cae -${stopLoss}%` },
+                  { label: "Take-Profit", value: takeProfit, set: setTakeProfit, min: 2, max: 50, color: "#00ff88", unit: "%", desc: `Vender automático si sube +${takeProfit}%` },
+                  { label: "Máx. por posición", value: maxAlloc, set: setMaxAlloc, min: 5, max: 50, color: "#4488ff", unit: "%", desc: `Nunca más del ${maxAlloc}% en un activo` },
+                  { label: "RSI Compra", value: rsiOversold, set: setRsiOversold, min: 10, max: 45, color: "#00ccaa", unit: "", desc: `Comprar si RSI < ${rsiOversold}` },
+                  { label: "RSI Venta", value: rsiOverbought, set: setRsiOverbought, min: 55, max: 90, color: "#ffaa00", unit: "", desc: `Vender si RSI > ${rsiOverbought}` },
+                ].map(s => (
+                  <div key={s.label} style={{ marginBottom: 16 }}>
+                    <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 6 }}>
+                      <span style={{ fontSize: 11, color: "#8a9aaa" }}>{s.label}</span>
+                      <span style={{ fontSize: 13, fontWeight: 700, color: s.color }}>{s.value}{s.unit}</span>
+                    </div>
+                    <input type="range" min={s.min} max={s.max} value={s.value} onChange={e => s.set(Number(e.target.value))} style={{ width: "100%", accentColor: s.color }} />
+                    <div style={{ fontSize: 9, color: "#4a6a8a", marginTop: 3 }}>{s.desc}</div>
+                  </div>
+                ))}
+              </div>
+
+              {/* Strategy info */}
+              <div className="card" style={{ background: "rgba(68,136,255,.04)", border: "1px solid rgba(68,136,255,.15)" }}>
+                <div style={{ fontSize: 10, color: "#4488ff", letterSpacing: 1.5, marginBottom: 10 }}>ESTRATEGIA DEL BOT</div>
+                {["RSI < 30 → señal de compra fuerte", "MACD alcista confirma entrada", "Bollinger bajo = posible rebote", "RSI > 70 → señal de venta", "Stop-loss protege el capital", "Take-profit asegura ganancias"].map((t, i) => (
+                  <div key={i} style={{ fontSize: 11, color: "#6a8aaa", padding: "3px 0", display: "flex", gap: 6 }}>
+                    <span style={{ color: "#4488ff40" }}>›</span>{t}
+                  </div>
+                ))}
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* ── SETTINGS VIEW ── */}
+        {view === "settings" && (
+          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 16 }}>
+
+            {/* Binance */}
+            <div className="card" style={{ border: "1px solid rgba(247,147,26,.2)", background: "rgba(247,147,26,.03)" }}>
+              <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 16 }}>
+                <div style={{ fontFamily: "'Syne',sans-serif", fontSize: 16, fontWeight: 800, color: "#f7931a" }}>◈ Binance</div>
+                {keysVerified.binance && <span style={{ fontSize: 10, color: "#00ff88", background: "rgba(0,255,136,.12)", padding: "2px 8px", borderRadius: 999, border: "1px solid rgba(0,255,136,.3)" }}>✓ CONECTADO</span>}
+              </div>
+              <div style={{ fontSize: 11, color: "#6a8aaa", marginBottom: 14, lineHeight: 1.6 }}>
+                1. Ve a <strong style={{ color: "#f7931a" }}>binance.com → API Management</strong><br />
+                2. Crea una API Key con permisos de <em>Spot Trading</em><br />
+                3. En PAPER usa <strong>testnet.binance.vision</strong><br />
+                4. Pega las claves aquí
+              </div>
+              <div style={{ display: "flex", flexDirection: "column", gap: 8, marginBottom: 12 }}>
+                <input value={binanceKey} onChange={e => setBinanceKey(e.target.value)} placeholder="API Key de Binance" style={{ width: "100%" }} />
+                <input value={binanceSecret} onChange={e => setBinanceSecret(e.target.value)} placeholder="API Secret de Binance" type="password" style={{ width: "100%" }} />
+              </div>
+              <button className="btn" onClick={() => verifyKeys("binance")} style={{ width: "100%", padding: "10px", borderRadius: 8, fontSize: 12, background: "rgba(247,147,26,.15)", color: "#f7931a", border: "1px solid rgba(247,147,26,.3)" }}>
+                VERIFICAR CONEXIÓN BINANCE
+              </button>
+              <div style={{ marginTop: 10, fontSize: 10, color: "#4a6a8a", lineHeight: 1.6 }}>
+                ⚠️ Activos disponibles: BTC, ETH, SOL, BNB, ADA, XRP, DOGE, AVAX y más de 300 pares
+              </div>
+            </div>
+
+            {/* Alpaca */}
+            <div className="card" style={{ border: "1px solid rgba(68,136,255,.2)", background: "rgba(68,136,255,.03)" }}>
+              <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 16 }}>
+                <div style={{ fontFamily: "'Syne',sans-serif", fontSize: 16, fontWeight: 800, color: "#4488ff" }}>▣ Alpaca</div>
+                {keysVerified.alpaca && <span style={{ fontSize: 10, color: "#00ff88", background: "rgba(0,255,136,.12)", padding: "2px 8px", borderRadius: 999, border: "1px solid rgba(0,255,136,.3)" }}>✓ CONECTADO</span>}
+              </div>
+              <div style={{ fontSize: 11, color: "#6a8aaa", marginBottom: 14, lineHeight: 1.6 }}>
+                1. Ve a <strong style={{ color: "#4488ff" }}>alpaca.markets → Paper Trading</strong><br />
+                2. Genera API Key en la sección <em>Your API Keys</em><br />
+                3. Paper trading = gratis, sin riesgo<br />
+                4. Pega las claves aquí
+              </div>
+              <div style={{ display: "flex", flexDirection: "column", gap: 8, marginBottom: 12 }}>
+                <input value={alpacaKey} onChange={e => setAlpacaKey(e.target.value)} placeholder="APCA-API-KEY-ID" style={{ width: "100%" }} />
+                <input value={alpacaSecret} onChange={e => setAlpacaSecret(e.target.value)} placeholder="APCA-API-SECRET-KEY" type="password" style={{ width: "100%" }} />
+              </div>
+              <button className="btn" onClick={() => verifyKeys("alpaca")} style={{ width: "100%", padding: "10px", borderRadius: 8, fontSize: 12, background: "rgba(68,136,255,.15)", color: "#4488ff", border: "1px solid rgba(68,136,255,.3)" }}>
+                VERIFICAR CONEXIÓN ALPACA
+              </button>
+              <div style={{ marginTop: 10, fontSize: 10, color: "#4a6a8a", lineHeight: 1.6 }}>
+                ⚠️ Activos: AAPL, NVDA, TSLA, MSFT, AMZN, META, SPY, QQQ, VOO, ARKK y más de 10.000 acciones y ETFs USA
+              </div>
+            </div>
+
+            {/* Capital config */}
+            <div className="card">
+              <div style={{ fontFamily: "'Syne',sans-serif", fontSize: 14, fontWeight: 800, marginBottom: 14 }}>💶 CAPITAL POR MODO</div>
+              {[["DEMO", "Capital demo ficticio", demoCapital, setDemoCapital, "#4488ff"], ["PAPER", "Capital paper (simulado en broker real)", paperCapital, setPaperCapital, "#ffaa00"]].map(([m, d, val, setter, c]) => (
+                <div key={m} style={{ marginBottom: 14, padding: 12, background: "rgba(0,0,0,.2)", borderRadius: 8 }}>
+                  <div style={{ fontSize: 10, color: c, letterSpacing: 1, marginBottom: 8 }}>{m} — {d}</div>
+                  <div style={{ display: "flex", gap: 8 }}>
+                    <input type="number" defaultValue={val} onBlur={e => setter(parseFloat(e.target.value) || val)} placeholder={`€ capital ${m}`} style={{ flex: 1 }} />
+                    <button className="btn" onClick={() => { setter(parseFloat(document.querySelector(`[data-mode="${m}"]`)?.value) || val); showNotif(`Capital ${m} actualizado`); }} style={{ padding: "8px 14px", borderRadius: 8, fontSize: 11, background: `${c}18`, color: c, border: `1px solid ${c}30` }}>OK</button>
+                  </div>
+                </div>
+              ))}
+              <div style={{ padding: 12, background: "rgba(255,68,102,.06)", borderRadius: 8, border: "1px solid rgba(255,68,102,.15)" }}>
+                <div style={{ fontSize: 10, color: "#ff4466", letterSpacing: 1, marginBottom: 6 }}>LIVE — Capital real (desde Binance/Alpaca)</div>
+                <div style={{ fontSize: 11, color: "#6a8aaa" }}>El capital real se obtiene automáticamente de tu cuenta al conectar las API keys. Deposita desde tu banco a través de la web de cada broker.</div>
+              </div>
+            </div>
+
+            {/* Guide */}
+            <div className="card" style={{ background: "rgba(0,255,136,.03)", border: "1px solid rgba(0,255,136,.1)" }}>
+              <div style={{ fontSize: 10, color: "#00ff88", letterSpacing: 1.5, marginBottom: 12 }}>📋 GUÍA DE USO</div>
+              {[
+                ["1️⃣ DEMO (ahora mismo)", "Sin registro. Practica con €1000 ficticios. Aprende cómo funciona el bot."],
+                ["2️⃣ PAPER (semanas 2-4)", "Abre cuenta en Alpaca (gratis). Conecta API de paper trading. El bot opera con dinero ficticio en mercados reales."],
+                ["3️⃣ PAPER Binance (semanas 2-4)", "Regístrate en binance.com. Usa la testnet. Practica con crypto de forma realista."],
+                ["4️⃣ LIVE (cuando estés listo)", "Solo cuando hayas visto resultados positivos en PAPER durante semanas. Empieza con poco (€100-200)."],
+              ].map(([title, desc]) => (
+                <div key={title} style={{ marginBottom: 14, padding: "10px 12px", background: "rgba(0,0,0,.2)", borderRadius: 8 }}>
+                  <div style={{ fontSize: 11, fontWeight: 700, color: "#c8d8e8", marginBottom: 4 }}>{title}</div>
+                  <div style={{ fontSize: 10, color: "#6a8aaa", lineHeight: 1.6 }}>{desc}</div>
+                </div>
+              ))}
+              <div style={{ padding: "10px 12px", background: "rgba(255,68,102,.06)", borderRadius: 8, fontSize: 10, color: "#ff446699", lineHeight: 1.6 }}>
+                ⚠️ El trading algorítmico conlleva riesgo de pérdida. Nunca inviertas dinero que no puedas perder. Este software es educativo.
+              </div>
+            </div>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
